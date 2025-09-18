@@ -15,6 +15,7 @@ from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException
 from webdriver_manager.chrome import ChromeDriverManager
 
 
@@ -141,8 +142,107 @@ def text_from_meta(driver, name_or_prop: str, is_prop=False) -> str:
     try:
         el = driver.find_element(By.CSS_SELECTOR, sel)
         return safe_get_attr(el, "content")
-    except Exception:
+    except NoSuchElementException:
         return ""
+
+
+# ------- Fix helpers (invalid selector + stale) -------
+
+NUM_RE = re.compile(r"([\d,.]+)\s*([kKmMbB]?)")  # e.g., 12.3K
+
+def parse_compact_number(s: str) -> str:
+    s = (s or "").strip()
+    m = NUM_RE.search(s)
+    if not m:
+        return ""
+    num, suf = m.groups()
+    try:
+        base = float(num.replace(",", ""))
+    except:
+        return ""
+    mul = 1
+    if suf.lower() == "k": mul = 1_000
+    elif suf.lower() == "m": mul = 1_000_000
+    elif suf.lower() == "b": mul = 1_000_000_000
+    return str(int(base * mul))
+
+def get_text_safe(driver, css: str) -> str:
+    try:
+        return driver.find_element(By.CSS_SELECTOR, css).text.strip()
+    except NoSuchElementException:
+        return ""
+
+def attr_safe(driver, css: str, attr: str) -> str:
+    try:
+        return driver.find_element(By.CSS_SELECTOR, css).get_attribute(attr) or ""
+    except NoSuchElementException:
+        return ""
+
+def retry_stale(fn, tries: int = 3, wait: float = 0.4):
+    for _ in range(tries):
+        try:
+            return fn()
+        except StaleElementReferenceException:
+            time.sleep(wait)
+    return fn()
+
+def find_text_contains(driver, word: str) -> str:
+    word_low = word.lower()
+    try:
+        els = driver.find_elements(
+            By.XPATH,
+            f"//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{word_low}')]"
+        )
+        for el in els:
+            t = el.text.strip()
+            if t and word_low in t.lower():
+                return t
+    except Exception:
+        pass
+    return ""
+
+
+def find_json_anywhere(driver) -> List[dict]:
+    blobs = []
+    scripts = driver.find_elements(By.TAG_NAME, "script")
+    for s in scripts:
+        try:
+            t = s.get_attribute("innerHTML") or ""
+            sid = s.get_attribute("id") or ""
+        except Exception:
+            t, sid = "", ""
+        if sid == "__PWS_DATA__" and t:
+            try:
+                blobs.append(json.loads(t))
+            except Exception:
+                pass
+        elif "{\"" in t and "}" in t:
+            # grab candidate objects from inline scripts
+            for chunk in re.findall(r"\{.*?\}", t, flags=re.DOTALL):
+                if any(k in chunk for k in ["\"id\"", "\"images\"", "\"pinner\"", "\"board\"", "\"commentCount\"", "\"saveCount\""]):
+                    try:
+                        blobs.append(json.loads(chunk))
+                    except Exception:
+                        pass
+    html = driver.page_source or ""
+    for chunk in re.findall(r"\{.*?\}", html, flags=re.DOTALL):
+        if any(k in chunk for k in ["\"id\"", "\"images\"", "\"pinner\"", "\"board\"", "\"commentCount\"", "\"saveCount\""]):
+            try:
+                blobs.append(json.loads(chunk))
+            except Exception:
+                pass
+    return blobs
+
+def pick_pin_dict(blobs: List[dict], pin_id_hint: str) -> dict:
+    for b in blobs:
+        cand = find_first_pin_like_dict(b, pin_id_hint=pin_id_hint)
+        if isinstance(cand, dict) and str(cand.get("id")) == str(pin_id_hint):
+            return cand
+    for b in blobs:
+        cand = find_first_pin_like_dict(b, pin_id_hint=None)
+        if isinstance(cand, dict):
+            return cand
+    return {}
 
 
 def scrape_pin_detail(driver, pin_url: str, keyword: str, wait_sec: float = 12.0) -> PinRow:
@@ -152,6 +252,7 @@ def scrape_pin_detail(driver, pin_url: str, keyword: str, wait_sec: float = 12.0
             EC.any_of(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "script#__PWS_DATA__")),
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-test-id='pin']")),
+                EC.presence_of_element_located((By.TAG_NAME, "img")),
             )
         )
     except Exception:
@@ -159,39 +260,47 @@ def scrape_pin_detail(driver, pin_url: str, keyword: str, wait_sec: float = 12.0
 
     pin_id = parse_pin_id(pin_url)
 
+    # 1) JSON (official & aggressive)
     raw_json = ""
     try:
         data_el = driver.find_element(By.CSS_SELECTOR, "script#__PWS_DATA__")
         raw_json = data_el.get_attribute("innerHTML") or ""
-    except Exception:
+    except NoSuchElementException:
         pass
 
     pin_dict = {}
     if raw_json:
         try:
             data = json.loads(raw_json)
-            cand = find_first_pin_like_dict(data, pin_id_hint=pin_id)
-            if isinstance(cand, dict):
-                pin_dict = cand
+            pin_dict = find_first_pin_like_dict(data, pin_id_hint=pin_id) or {}
         except Exception:
             pin_dict = {}
 
+    if not pin_dict:
+        blobs = find_json_anywhere(driver)
+        pin_dict = pick_pin_dict(blobs, pin_id_hint=pin_id)
+
+    # 2) Fields from JSON
     title = str(pin_dict.get("grid_title") or pin_dict.get("title") or "")
     description = str(pin_dict.get("description") or "")
     created_at = str(pin_dict.get("created_at") or pin_dict.get("createdAt") or "")
 
-    image_url, image_width, image_height = "", "", ""
+    image_url = ""
+    image_width = ""
+    image_height = ""
     images = pin_dict.get("images") if isinstance(pin_dict, dict) else None
     if isinstance(images, dict):
         for size_key in ["orig", "564x", "474x", "236x"]:
-            if size_key in images and isinstance(images[size_key], dict):
-                image_url = str(images[size_key].get("url") or "")
-                image_width = str(images[size_key].get("width") or "")
-                image_height = str(images[size_key].get("height") or "")
+            d = images.get(size_key)
+            if isinstance(d, dict):
+                image_url = str(d.get("url") or image_url)
+                image_width = str(d.get("width") or image_width)
+                image_height = str(d.get("height") or image_height)
                 if image_url:
                     break
 
-    save_count, comment_count = "", ""
+    save_count = ""
+    comment_count = ""
     for key in ["saveCount", "aggregated_pin_data", "aggregatedStats", "counts", "stats"]:
         d = pin_dict.get(key) if isinstance(pin_dict, dict) else None
         if isinstance(d, dict):
@@ -222,16 +331,20 @@ def scrape_pin_detail(driver, pin_url: str, keyword: str, wait_sec: float = 12.0
             if owner_usr and slug:
                 board_url = f"https://www.pinterest.com/{owner_usr}/{slug}/"
 
+    # 3) DOM/XPath fallbacks (retry to avoid stales; no :contains())
     if not title:
         title = text_from_meta(driver, "og:title", is_prop=True) or text_from_meta(driver, "twitter:title")
+        if not title:
+            title = retry_stale(lambda: get_text_safe(driver, "h1")) or retry_stale(lambda: get_text_safe(driver, "h2"))
+
     if not description:
         description = text_from_meta(driver, "og:description", is_prop=True) or text_from_meta(driver, "description")
+
     if not image_url:
         image_url = text_from_meta(driver, "og:image", is_prop=True)
-
-    if not image_url or not image_width or not image_height:
+    if (not image_url) or (not image_width) or (not image_height):
         try:
-            img = driver.find_element(By.CSS_SELECTOR, "img")
+            img = retry_stale(lambda: driver.find_element(By.CSS_SELECTOR, "img"))
             if not image_url:
                 image_url = extract_image_src(img)
             if not image_width:
@@ -240,6 +353,93 @@ def scrape_pin_detail(driver, pin_url: str, keyword: str, wait_sec: float = 12.0
                 image_height = safe_get_attr(img, "height")
         except Exception:
             pass
+
+    # Saves / Comments text present in UI
+    if not save_count:
+        t1 = retry_stale(lambda: get_text_safe(driver, "[data-test-id='socialCount']"))
+        t2 = retry_stale(lambda: get_text_safe(driver, "div[class*='SocialCounts'], span[class*='SocialCounts']"))
+        t3 = find_text_contains(driver, "save")
+        for t in [t1, t2, t3]:
+            if not t:
+                continue
+            m = re.search(r"([\d.,KMBkmb]+)\s*saves?", t)
+            if m:
+                save_count = parse_compact_number(m.group(1))
+                break
+
+    if not comment_count:
+        t1 = retry_stale(lambda: get_text_safe(driver, "[data-test-id='commentsCount']"))
+        t2 = find_text_contains(driver, "comment")
+        for t in [t1, t2]:
+            if not t:
+                continue
+            m = re.search(r"([\d.,KMBkmb]+)\s*comments?", t)
+            if m:
+                comment_count = parse_compact_number(m.group(1))
+                break
+
+    # Pinner from visible links (avoid holding stale refs)
+    if not pinner_username or not pinner_profile_url:
+        try:
+            links = retry_stale(lambda: driver.find_elements(By.CSS_SELECTOR, "a[href^='https://www.pinterest.com/'], a[href^='/']"))
+            for a in links:
+                href = safe_get_attr(a, "href")
+                if not href or "/pin/" in href:
+                    continue
+                if href.startswith("/"):
+                    href = "https://www.pinterest.com" + href
+                path = href.replace("https://www.pinterest.com/", "")
+                if path and "/" in path and path.count("/") == 1:
+                    maybe_user = path.strip("/")
+                    if maybe_user and "ideas" not in maybe_user.lower():
+                        pinner_username = pinner_username or maybe_user
+                        pinner_profile_url = pinner_profile_url or href
+                        if not pinner_fullname:
+                            pinner_fullname = a.text.strip() or pinner_fullname
+                        break
+        except Exception:
+            pass
+
+    # Board ("/<user>/<board>/")
+    if not board_url:
+        try:
+            links = retry_stale(lambda: driver.find_elements(By.CSS_SELECTOR, "a[href*='pinterest.com/']"))
+            for a in links:
+                href = safe_get_attr(a, "href") or ""
+                if "/pin/" in href:
+                    continue
+                path = href.replace("https://www.pinterest.com/", "").strip("/")
+                # user/board/ (two segments)
+                if path.count("/") == 2:
+                    board_url = href
+                    if not board_name:
+                        board_name = a.text.strip()
+                    break
+        except Exception:
+            pass
+
+    # Outbound link (Visit button or external)
+    if not outbound_link:
+        outbound_link = retry_stale(lambda: attr_safe(driver, "a[data-test-id='PinActionBar-visitButton']", "href"))
+    if not outbound_link:
+        try:
+            links = retry_stale(lambda: driver.find_elements(By.CSS_SELECTOR, "a[target='_blank']"))
+            for a in links:
+                rel = a.get_attribute("rel") or ""
+                href = a.get_attribute("href") or ""
+                if not href or href.startswith("https://www.pinterest.com/"):
+                    continue
+                if "nofollow" in rel or "noopener" in rel or "noreferrer" in rel:
+                    outbound_link = href
+                    break
+        except Exception:
+            pass
+
+    # Normalize numbers if still compact text
+    if save_count and not save_count.isdigit():
+        save_count = parse_compact_number(save_count)
+    if comment_count and not comment_count.isdigit():
+        comment_count = parse_compact_number(comment_count)
 
     return PinRow(
         keyword=keyword,
@@ -364,7 +564,6 @@ start = st.button("Start scraper")
 out_df = pd.DataFrame()
 
 if start:
-    # Validate input
     work_df = st.session_state.kw_df.copy()
     work_df["keyword"] = work_df["keyword"].astype(str).str.strip()
     work_df["limit"] = pd.to_numeric(work_df["limit"], errors="coerce").fillna(default_limit).astype(int)
@@ -387,7 +586,6 @@ if start:
                 status.write(f"Searching '{kw}' (limit {lim})")
                 pin_urls = collect_pin_urls_for_keyword(driver, kw, lim, slow=float(slow_seconds))
 
-                # Per keyword progress
                 for i, pu in enumerate(pin_urls, 1):
                     status.write(f"[{kw_index}/{total_kw}] {kw}: pin {i}/{len(pin_urls)}")
                     try:
@@ -395,8 +593,7 @@ if start:
                         rows.append(pr)
                     except Exception as e:
                         st.write(f"Failed pin: {pu} ({e})")
-                    # update global progress estimate
-                    done_ratio = ( (kw_index - 1) + i / max(1, len(pin_urls)) ) / max(1, total_kw)
+                    done_ratio = ((kw_index - 1) + i / max(1, len(pin_urls))) / max(1, total_kw)
                     progress.progress(min(1.0, done_ratio))
 
             driver.quit()
@@ -415,7 +612,6 @@ if not out_df.empty:
     st.subheader("Preview")
     st.dataframe(out_df.head(100), use_container_width=True)
 
-    # Download buttons
     csv_buf = io.StringIO()
     out_df.to_csv(csv_buf, index=False, encoding="utf-8")
     st.download_button(

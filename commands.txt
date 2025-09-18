@@ -1,4 +1,8 @@
 pip install selenium webdriver-manager pandas
+streamlit run app.py
+
+
+
 python pinterest_scraper_rich.py --input keywords.csv --output pins_out.csv --default-limit 40 --headful --slow 1.0
 
 
