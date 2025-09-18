@@ -1,0 +1,7 @@
+pip install selenium webdriver-manager pandas
+python pinterest_scraper_rich.py --input keywords.csv --output pins_out.csv --default-limit 40 --headful --slow 1.0
+
+
+Omit --headful for headless mode.
+
+Increase --slow if you see rate-limiting or missing items.
