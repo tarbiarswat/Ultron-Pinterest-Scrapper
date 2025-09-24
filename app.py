@@ -17,7 +17,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException
 from webdriver_manager.chrome import ChromeDriverManager
 
-
 # ===============================
 # Model / constants
 # ===============================
@@ -44,7 +43,6 @@ class PinRow:
     outbound_link: str
     created_at: str
 
-
 # ===============================
 # Driver (with CDP performance logs)
 # ===============================
@@ -62,14 +60,10 @@ def build_driver(headless: bool = False, window_size: str = "1400,1000") -> webd
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
     )
-    # Enable Chrome performance logging so we can read Network.* events
-    opts.set_capability(
-        "goog:loggingPrefs",
-        {"performance": "ALL"}
-    )
-    # Create driver
+    # enable performance logs so we can call Network.getResponseBody
+    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+
     driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=opts)
-    # Enable CDP Network so we can later fetch response bodies by requestId
     try:
         driver.execute_cdp_cmd("Network.enable", {})
         driver.execute_cdp_cmd("Page.enable", {})
@@ -80,7 +74,6 @@ def build_driver(headless: bool = False, window_size: str = "1400,1000") -> webd
     except Exception:
         pass
     return driver
-
 
 # ===============================
 # Helpers
@@ -156,11 +149,11 @@ def find_text_contains(driver, word: str) -> str:
         pass
     return ""
 
-
 # ===============================
 # JSON hunters (DOM + CDP logs)
 # ===============================
 def find_first_pin_like_dict(obj: Any, pin_id_hint: Optional[str] = None) -> Optional[Dict]:
+    """Fallback: walk any JSON structure and grab the first dict that looks like a pin."""
     stack = [obj]
     fallback = None
     while stack:
@@ -177,7 +170,71 @@ def find_first_pin_like_dict(obj: Any, pin_id_hint: Optional[str] = None) -> Opt
             stack.extend(cur)
     return fallback
 
+def _cdp_get_body_text(driver, request_id: str) -> str:
+    """Fetch body; if base64-encoded, decode (brotli/gzip/deflate/plain)."""
+    body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})
+    txt = body.get("body") or ""
+    if body.get("base64Encoded"):
+        import base64, zlib
+        try:
+            import brotli
+        except Exception:
+            brotli = None
+        raw = base64.b64decode(txt)
+        decoded = None
+        if brotli:
+            try:
+                decoded = brotli.decompress(raw)
+            except Exception:
+                decoded = None
+        if decoded is None:
+            for try_decode in (
+                lambda b: zlib.decompress(b, 16 + zlib.MAX_WBITS),
+                lambda b: zlib.decompress(b),
+                lambda b: b,
+            ):
+                try:
+                    decoded = try_decode(raw)
+                    break
+                except Exception:
+                    continue
+        txt = (decoded or b"").decode("utf-8", "ignore")
+    return txt.strip()
+
+def _extract_closeup_from_json(obj: Any) -> Optional[Dict]:
+    """
+    Look for the Closeup JSON shape used in your coursework:
+    requestParameters.name == "CloseupDetailQuery" → response.data.v3GetPinQuery.data
+    """
+    try:
+        # Sometimes the JSON itself is exactly that object
+        rp = obj.get("requestParameters", {})
+        if isinstance(rp, dict) and rp.get("name") == "CloseupDetailQuery":
+            data = obj.get("response", {}).get("data", {}).get("v3GetPinQuery", {}).get("data")
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+
+    # Otherwise, walk nested
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if "requestParameters" in cur and isinstance(cur["requestParameters"], dict) and cur["requestParameters"].get("name") == "CloseupDetailQuery":
+                try:
+                    data = cur.get("response", {}).get("data", {}).get("v3GetPinQuery", {}).get("data")
+                    if isinstance(data, dict):
+                        return data
+                except Exception:
+                    pass
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
+
 def hunt_json_in_scripts(driver) -> List[dict]:
+    """Existing generic hunter + keep full JSON scripts when possible."""
     blobs = []
     scripts = driver.find_elements(By.TAG_NAME, "script")
     for s in scripts:
@@ -191,34 +248,46 @@ def hunt_json_in_scripts(driver) -> List[dict]:
                 blobs.append(json.loads(t))
             except Exception:
                 pass
+        # NEW: many pages embed pure JSON blocks (not JS) that include CloseupDetailQuery
+        if "requestParameters" in t and "CloseupDetailQuery" in t:
+            try:
+                blobs.append(json.loads(t))
+            except Exception:
+                # fall back to rough object snips if needed
+                pass
         elif "{\"" in t and "}" in t:
+            # rough object snips fallback
             for chunk in re.findall(r"\{.*?\}", t, flags=re.DOTALL):
-                if any(k in chunk for k in ['"id"','"images"','"pinner"','"board"','"commentCount"','"saveCount"']):
+                if any(k in chunk for k in ['"id"','"images"','"pinner"','"board"','"commentCount"','"saveCount"','"CloseupDetailQuery"']):
                     try:
                         blobs.append(json.loads(chunk))
                     except Exception:
                         pass
+
     html = driver.page_source or ""
-    for chunk in re.findall(r"\{.*?\}", html, flags=re.DOTALL):
-        if any(k in chunk for k in ['"id"','"images"','"pinner"','"board"','"commentCount"','"saveCount"']):
-            try:
-                blobs.append(json.loads(chunk))
-            except Exception:
-                pass
+    if "CloseupDetailQuery" in html and "requestParameters" in html:
+        # try to capture whole <script> JSONs
+        for m in re.finditer(r"<script[^>]*>(\{.*?\})</script>", html, re.DOTALL|re.IGNORECASE):
+            block = m.group(1)
+            if "CloseupDetailQuery" in block:
+                try:
+                    blobs.append(json.loads(block))
+                except Exception:
+                    pass
     return blobs
 
 def hunt_json_in_cdp_logs(driver, pin_id: str) -> Optional[dict]:
     """
     Read Chrome 'performance' logs, pull Network.responseReceived events with JSON,
     then fetch bodies via Network.getResponseBody(requestId) and look for a pin dict.
+    Also checks for CloseupDetailQuery responses.
     """
     try:
         logs = driver.get_log("performance")
     except Exception:
         return None
 
-    # newest first
-    for entry in reversed(logs[-500:]):
+    for entry in reversed(logs[-600:]):
         try:
             msg = json.loads(entry.get("message", "{}"))
             m = msg.get("message", {})
@@ -239,23 +308,24 @@ def hunt_json_in_cdp_logs(driver, pin_id: str) -> Optional[dict]:
 
         # get body via CDP
         try:
-            body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": req_id})
-            txt = (body.get("body") or "").strip()
-            if not txt:
-                continue
-            # some JSONs are large; ignore non-JSON or HTML
+            txt = _cdp_get_body_text(driver, req_id)
             if not (txt.startswith("{") or txt.startswith("[")):
                 continue
             data = json.loads(txt)
         except Exception:
             continue
 
+        # 1) Prefer CloseupDetailQuery data if present
+        closeup = _extract_closeup_from_json(data)
+        if isinstance(closeup, dict):
+            return closeup
+
+        # 2) Else fall back to generic pin-like dict
         cand = find_first_pin_like_dict(data, pin_id_hint=pin_id)
         if isinstance(cand, dict) and (not pin_id or str(cand.get("id")) == pin_id):
             return cand
 
     return None
-
 
 # ===============================
 # Search page primitives
@@ -277,7 +347,7 @@ def extract_pin_urls_from_view(driver, seen_urls: Set[str]) -> List[str]:
         urls.append(href)
     return urls
 
-def scroll_results(driver, slow: float = 0.9, step_px: int = 1200):
+def scroll_results(driver, slow: float = 1.0, step_px: int = 1200):
     driver.execute_script(f"window.scrollBy(0, {step_px});")
     time.sleep(slow)
 
@@ -285,7 +355,7 @@ def collect_pin_urls_for_keyword(driver, keyword: str, limit_n: int, slow: float
     url = SEARCH_URL.format(query=keyword.replace(" ", "%20"))
     driver.get(url)
     try:
-        WebDriverWait(driver, 12).until(
+        WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-test-id='SearchPageContent']"))
         )
     except Exception:
@@ -320,9 +390,117 @@ def text_from_meta(driver, name_or_prop: str, is_prop=False) -> str:
     except NoSuchElementException:
         return ""
 
+# ===============================
+# Closeup field mapping helpers
+# ===============================
+def enrich_from_closeup_data(close: Dict[str, Any], fields: Dict[str, str]) -> Dict[str, str]:
+    """
+    Map the CloseupDetailQuery 'data' to our output fields.
+    We’re conservative and only fill fields that are still empty.
+    """
+    out = dict(fields)  # copy
+
+    # Names seen in your coursework JSON:
+    #  - gridTitle / closeupUnifiedDescription / createdAt
+    #  - pinner.username / pinner.full_name
+    #  - images.{orig,564x,...}.url
+    #  - aggregatedPinData.commentCount / saveCount
+    #  - repinCount/shareCount (fallback)
+    #  - board.{name, owner{username}, slug}
+    #  - link (outbound)
+    title = str(close.get("gridTitle") or close.get("title") or "")
+    desc = str(close.get("closeupUnifiedDescription") or close.get("description") or "")
+    created = str(close.get("createdAt") or "")
+
+    if not out.get("title") and title:
+        out["title"] = title
+    if not out.get("description") and desc:
+        out["description"] = desc
+    if not out.get("created_at") and created:
+        out["created_at"] = created
+
+    # counts
+    agg = close.get("aggregatedPinData") or close.get("aggregated_pin_data") or {}
+    if isinstance(agg, dict):
+        sc = agg.get("saveCount")
+        cc = agg.get("commentCount")
+        if not out.get("save_count") and sc is not None:
+            out["save_count"] = str(sc)
+        if not out.get("comment_count") and cc is not None:
+            out["comment_count"] = str(cc)
+
+    # sometimes only repinCount/shareCount present
+    if not out.get("save_count"):
+        rc = close.get("repinCount")
+        if rc is not None:
+            out["save_count"] = str(rc)
+
+    # pinner
+    pinner = close.get("pinner") or {}
+    if isinstance(pinner, dict):
+        if not out.get("pinner_username"):
+            out["pinner_username"] = str(pinner.get("username") or "")
+        if not out.get("pinner_fullname"):
+            out["pinner_fullname"] = str(pinner.get("full_name") or pinner.get("fullName") or "")
+        if not out.get("pinner_profile_url") and out.get("pinner_username"):
+            out["pinner_profile_url"] = f"https://www.pinterest.com/{out['pinner_username']}/"
+
+    # board
+    board = close.get("board") or {}
+    if isinstance(board, dict):
+        if not out.get("board_name"):
+            out["board_name"] = str(board.get("name") or "")
+        if not out.get("board_url"):
+            candidate = board.get("url") or ""
+            if candidate:
+                out["board_url"] = str(candidate)
+            else:
+                owner = board.get("owner") or {}
+                owner_usr = owner.get("username") or ""
+                slug = board.get("slug") or ""
+                if owner_usr and slug:
+                    out["board_url"] = f"https://www.pinterest.com/{owner_usr}/{slug}/"
+
+    # outbound link
+    if not out.get("outbound_link"):
+        out["outbound_link"] = str(close.get("link") or close.get("dominant_link") or "")
+
+    # images
+    if not out.get("image_url"):
+        images = close.get("images") or {}
+        if isinstance(images, dict):
+            for size_key in ["orig", "564x", "474x", "236x"]:
+                d = images.get(size_key)
+                if isinstance(d, dict):
+                    out["image_url"] = str(d.get("url") or out.get("image_url") or "")
+                    if not out.get("image_width") and d.get("width"):
+                        out["image_width"] = str(d.get("width"))
+                    if not out.get("image_height") and d.get("height"):
+                        out["image_height"] = str(d.get("height"))
+                    if out.get("image_url"):
+                        break
+
+    return out
+
+def get_closeup_data_from_any(driver) -> Optional[Dict[str, Any]]:
+    """
+    Try CDP logs first (most reliable), then script tags / HTML.
+    """
+    # CDP
+    close = hunt_json_in_cdp_logs(driver, pin_id="")
+    if isinstance(close, dict):
+        return close
+
+    # Scripts & HTML
+    blobs = hunt_json_in_scripts(driver)
+    for b in blobs:
+        close = _extract_closeup_from_json(b)
+        if isinstance(close, dict):
+            return close
+    return None
 
 # ===============================
-# Scrape a pin (CDP + fallbacks)
+# Scrape a pin (CDP + Closeup + fallbacks)
 # ===============================
 def scrape_pin_detail(driver, pin_url: str, keyword: str, wait_sec: float = 12.0) -> PinRow:
     driver.get(pin_url)
@@ -339,7 +517,7 @@ def scrape_pin_detail(driver, pin_url: str, keyword: str, wait_sec: float = 12.0
 
     pin_id = parse_pin_id(pin_url)
 
-    # 1) Try __PWS_DATA__ / inline scripts
+    # 1) __PWS_DATA__ or inline JSON (generic)
     pin_dict: Dict[str, Any] = {}
     try:
         data_el = driver.find_element(By.CSS_SELECTOR, "script#__PWS_DATA__")
@@ -352,26 +530,32 @@ def scrape_pin_detail(driver, pin_url: str, keyword: str, wait_sec: float = 12.0
     except Exception:
         pass
 
-    # 2) If still thin → parse from CDP performance logs
+    # 2) CDP bodies (generic or Closeup)
     if not pin_dict or not any(k in pin_dict for k in ("pinner", "board", "images", "counts", "aggregatedStats", "saveCount")):
         net_cand = hunt_json_in_cdp_logs(driver, pin_id)
         if isinstance(net_cand, dict):
             pin_dict = net_cand
 
-    # 3) If still thin → brute hunt in other scripts / HTML
+    # 3) Script/HTML brute hunt
     if not pin_dict or not any(k in pin_dict for k in ("pinner", "board", "images")):
         blobs = hunt_json_in_scripts(driver)
         cand = None
         for b in blobs:
-            cand = find_first_pin_like_dict(b, pin_id_hint=pin_id)
-            if isinstance(cand, dict):
+            # prefer Closeup if available
+            close = _extract_closeup_from_json(b)
+            if isinstance(close, dict):
+                cand = close
+                break
+            c2 = find_first_pin_like_dict(b, pin_id_hint=pin_id)
+            if isinstance(c2, dict):
+                cand = c2
                 break
         if isinstance(cand, dict):
             pin_dict = cand
 
-    # Extract preferred fields
-    title = str(pin_dict.get("grid_title") or pin_dict.get("title") or "")
-    description = str(pin_dict.get("description") or "")
+    # 4) Base fields from whatever pin_dict we have
+    title = str(pin_dict.get("grid_title") or pin_dict.get("gridTitle") or pin_dict.get("title") or "")
+    description = str(pin_dict.get("description") or pin_dict.get("closeupUnifiedDescription") or "")
     created_at = str(pin_dict.get("created_at") or pin_dict.get("createdAt") or "")
 
     image_url = ""
@@ -390,12 +574,12 @@ def scrape_pin_detail(driver, pin_url: str, keyword: str, wait_sec: float = 12.0
 
     save_count = ""
     comment_count = ""
-    for key in ["saveCount", "aggregated_pin_data", "aggregatedStats", "counts", "stats"]:
+    for key in ["saveCount", "aggregated_pin_data", "aggregatedPinData", "aggregatedStats", "counts", "stats"]:
         d = pin_dict.get(key) if isinstance(pin_dict, dict) else None
         if isinstance(d, dict):
             save_count = save_count or str(d.get("saveCount") or d.get("saves") or "")
             comment_count = comment_count or str(d.get("commentCount") or d.get("comments") or "")
-    save_count = save_count or str(pin_dict.get("saveCount") or "")
+    save_count = save_count or str(pin_dict.get("saveCount") or pin_dict.get("repinCount") or "")
     comment_count = comment_count or str(pin_dict.get("commentCount") or "")
 
     outbound_link = str(pin_dict.get("link") or pin_dict.get("dominant_link") or "")
@@ -420,7 +604,33 @@ def scrape_pin_detail(driver, pin_url: str, keyword: str, wait_sec: float = 12.0
             if owner_usr and slug:
                 board_url = f"https://www.pinterest.com/{owner_usr}/{slug}/"
 
-    # DOM/XPath fallbacks
+    # 5) Try to enrich using CloseupDetailQuery explicitly (even if we already had some data)
+    closeup = get_closeup_data_from_any(driver)
+    if isinstance(closeup, dict):
+        fields_now = {
+            "title": title, "description": description, "created_at": created_at,
+            "image_url": image_url, "image_width": image_width, "image_height": image_height,
+            "save_count": save_count, "comment_count": comment_count,
+            "pinner_username": pinner_username, "pinner_fullname": pinner_fullname, "pinner_profile_url": pinner_profile_url,
+            "board_name": board_name, "board_url": board_url, "outbound_link": outbound_link
+        }
+        enriched = enrich_from_closeup_data(closeup, fields_now)
+        title = enriched["title"]
+        description = enriched["description"]
+        created_at = enriched["created_at"]
+        image_url = enriched["image_url"]
+        image_width = enriched["image_width"]
+        image_height = enriched["image_height"]
+        save_count = enriched["save_count"]
+        comment_count = enriched["comment_count"]
+        pinner_username = enriched["pinner_username"]
+        pinner_fullname = enriched["pinner_fullname"]
+        pinner_profile_url = enriched["pinner_profile_url"]
+        board_name = enriched["board_name"]
+        board_url = enriched["board_url"]
+        outbound_link = enriched["outbound_link"]
+
+    # 6) DOM/XPath fallbacks for any remaining blanks
     if not title:
         title = text_from_meta(driver, "og:title", is_prop=True) or text_from_meta(driver, "twitter:title")
         if not title:
@@ -555,7 +765,6 @@ def scrape_pin_detail(driver, pin_url: str, keyword: str, wait_sec: float = 12.0
         created_at=created_at or "",
     )
 
-
 # ===============================
 # Streamlit UI
 # ===============================
@@ -564,7 +773,7 @@ st.set_page_config(page_title="Pinterest Scraper UI", layout="wide")
 if "kw_df" not in st.session_state:
     st.session_state.kw_df = pd.DataFrame([{"keyword": "technology", "limit": 40}])
 
-st.title("Pinterest Scraper UI (Selenium + CDP)")
+st.title("Pinterest Scraper UI (Selenium + CDP + Closeup JSON)")
 
 with st.sidebar:
     st.header("Controls")
