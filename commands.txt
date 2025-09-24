@@ -1,4 +1,4 @@
-pip install selenium webdriver-manager pandas
+pip install streamlit selenium webdriver-manager pandas
 streamlit run app.py
 
 
